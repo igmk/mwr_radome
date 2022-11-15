@@ -10,7 +10,7 @@ hygroscopic properties is added to the data. The radome
 status flag can help find the optimal time to replace
 the radome.
 
-This toolset should work with the HDCP2 SAMD data format 
+This toolset is compatible with the HDCP2 SAMD data format 
 and the E-PROFILE data format. It is also functional
 with the standard RPG (HATPRO) data format, however this is
 not recommended. The RPG spectral retrieval (SPC) is currently
@@ -24,15 +24,18 @@ to integrate into your pipeline.
 The following packages are required:
 
 ```
-xarray, collections, datetime, glob, typing, shutil, re
+numpy, xarray, collections, datetime, glob, typing, shutil, re, os, sys, matplotlib, json
 ```
 ## Getting started
 
-Take a look into the example in ./envVars/rao_mwr02/. 
-For each instrument you would like to check, please define
-all the variables listed in the examples.
-The output will then be saved in a similar folder structure
-with "orig" replaced by "qc_done" or "radome".
+Take a look into the example in `./envVars/rao_mwr02/`. 
+For each instrument you would like to check, please copy 
+env_vars_general.json to `./envVars/<station>/` and define
+all the variables listed in the example.
+The output will then be saved in the folder structure you
+define. 
+
+"format" can be "e-profile", "", or undefined.
 
 Put your environment-variable-json-files in a folder
 with the same name as your station (which you can choose
