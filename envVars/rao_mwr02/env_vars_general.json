@@ -1,0 +1,9 @@
+{
+	"pathRadomeMonitoring": "N:/data/path/radome/",
+	"pathRetrieval": "N:/data/path/spc_retrieval/{:/%Y/%Y%m/%y%m%d.SPC.NC}",
+	"pathOrig": "N:/data/path/orig/{:%Y/%Y%m/sups_rao_mwr02_l1_tb_v01_%Y%m%d*.nc}",
+	"pathQCDone": "N:/data/path/qc_done/{:%Y/%Y%m}/",
+	"timePeriodUpdate" : "last2Days",
+	"newRadomeTimes" : ["2021-06-01", "2021-12-01", "2022-06-01", "2022-12-01"],
+	"format" : "e-profile"
+}
