@@ -5,8 +5,8 @@
 # Author:     Moritz Loeffler
 # Created:    2022-11-10
 # Python Version:   3.6
-# Version:    1
-# Last Edit:  2022-11-15
+# Version:    1.1
+# Last Edit:  2024-05-03
 # --------------------------------
 """
 Data quality checks and monitoring of MWR devices with high resolution data.
@@ -32,9 +32,9 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.units as munits
 try:
-    from bottleneck import nanmean, nansum, nanmax
+    from bottleneck import nanmean, nansum, nanmax, nanmedian
 except ModuleNotFoundError:
-    from numpy import nanmean, nansum, nanmax
+    from numpy import nanmean, nansum, nanmax, nanmedian
 
 sys.path.append(os.path.dirname(__file__))
 import functions
@@ -252,16 +252,53 @@ class MWRQuality(object):
             ds['difference'] = (["time", self.nfreq], ds[self.tbVar].values - ds['tb_retrieval'].values)
         except KeyError:
             pass  # No retrieval found
+        ds = self.addRadomeVariablesToDataset(ds)
+        return ds
+
+    def addRadomeVariablesToDataset(self, ds: xr.Dataset) -> xr.Dataset:
+        durationOfRainAttrs = OrderedDict([('long_name', 'duration of rain event'),
+                                ('unit', 's'),
+                                ('comment', "Consecutive rain events, without complete drying of radome are counted" +
+                                 " as one.")
+                                ])
+        timeToDryAttrs = OrderedDict([('long_name', 'duration of wet radome after rain event'),
+                                ('unit', 's'),
+                                ('comment', "This variable is calculated only using the bias between spectral " +
+                                 "retrieval and observation. It is the time between end of rain event (rain sensor)" +
+                                 " and first time the difference is below a threshold.")
+                                             ])
+        maxDiffAttrs = OrderedDict([('long_name', 'Maximum difference between observation and spectral retrieval during and after rain event'),
+            ('unit', 'K'),
+            ('comments', "Only filled if it applies.")
+            ])
+        intDiffAttrs = OrderedDict([
+            ('long_name', 'Integrated difference between observation and spectral retrieval during and after rain event'),
+            ('unit', 'K s'),
+            ('comments', "Only filled if it applies.")
+            ])
         ds["durationOfRain"] = xr.Variable(dims=('time'),
                                            data=ds[self.rainFlagVar].values.copy(),
-                                           encoding=dict(dtype="float32")
-                                           )
+                                           encoding=dict(dtype="float32"),
+                                           attrs = durationOfRainAttrs)
         ds["durationOfRain"][:] = np.nan
         ds["timeToDry"] = xr.Variable(dims=('time'),
                                       data=ds[self.rainFlagVar].values.copy(),
-                                      encoding=dict(dtype="float32")
+                                      encoding=dict(dtype="float32"),
+                                      attrs=timeToDryAttrs
                                       )
         ds["timeToDry"][:] = np.nan
+        ds["maxDiff"] = xr.Variable(dims=('time'),
+                                           data=ds[self.rainFlagVar].values.copy(),
+                                           encoding=dict(dtype="float32"),
+                                      attrs=maxDiffAttrs
+                                           )
+        ds["maxDiff"][:] = np.nan
+        ds["integratedDiff"] = xr.Variable(dims=('time'),
+                                      data=ds[self.rainFlagVar].values.copy(),
+                                      encoding=dict(dtype="float32"),
+                                      attrs=intDiffAttrs
+                                      )
+        ds["integratedDiff"][:] = np.nan
         return ds
 
     def checkAngle(self, ds: xr.Dataset) -> xr.Dataset:
@@ -366,25 +403,39 @@ class MWRQuality(object):
         endOfRain = None
         firstTimeBelowThreshold = None
         if self.formatting == "e-profile":
-            threshold = nanmean(ds['difference'].loc[{self.freq: 53.86}].values[ds["rain_flag"] == 0]) + 2
+            threshold = nanmedian(ds['difference'].loc[{self.freq: 53.86}].values[ds["rain_flag"] == 0]) + 2
             ds['difference'].loc[{self.freq: 53.86}][-1] = threshold - 2
             difference = ds['difference'].loc[{self.freq: 53.86}]
-            tb_9 = ds[self.tbVar].loc[{self.freq: 53.86}]
         else:
-            threshold = nanmean(ds['difference'].loc[{self.nfreq: 9}].values[ds["rain_flag"] == 0]) + 2
+            threshold = nanmedian(ds['difference'].loc[{self.nfreq: 9}].values[ds["rain_flag"] == 0]) + 2
             ds['difference'].loc[{self.nfreq: 9}][-1] = threshold - 2
             difference = ds['difference'].loc[{self.nfreq: 9}]
-            tb_9 = ds[self.tbVar].loc[{self.nfreq: 9}]
+        radomeWetCondition = (difference > threshold) & (ds['ele_flag'] == 0) & (ds['q_retrieval'] == 0)
+        buffer_time_func = lambda diff: np.timedelta64(180, "s") * diff
+        tm1 = ds["time"][0] - np.timedelta64(1, "s")
+        lastDiff = 0
+        integratedDiff = 0
+        maxDiff = 0
+        firstMissing = None
         for time in ds['time']:
+            if np.isnan(difference.sel(time=time)):
+                # skip missing values
+                wetRadomeTimeSeries.append(0)
+                if firstMissing is None:
+                    firstMissing = time
+                continue
             rain = ds['rain_flag'].sel(time=time) == 1
             if dry and not rain:
                 wetRadomeTimeSeries.append(0)
                 continue
-            radomeWet = ((difference.loc[{'time': time}] > threshold or
-                          np.isnan(tb_9.loc[{'time': time}])) and
-                         ds['ele_flag'].loc[{'time': time}] == 0 and
-                         ds['q_retrieval'].loc[{'time': time}] == 0)
+            radomeWet = radomeWetCondition.loc[{'time': time}]
             wetRadomeTimeSeries.append(int(not dry))
+            deltaT = time - tm1
+            integratedDiff += ((lastDiff + difference.loc[{'time': time}]) / 2
+                               ) * (deltaT / np.timedelta64(1, 's'))
+            lastDiff = difference.loc[{'time': time}]
+            maxDiff = np.max([maxDiff, lastDiff])
+            tm1 = time
             if rain and dry:
                 if radomeWet:
                     dry = False
@@ -394,39 +445,41 @@ class MWRQuality(object):
                     endOfRain = time
                     durationOfRain = endOfRain - beginOfRain
                 if radomeWet:  # radome is still wet
+                    firstMissing = None  # still wet after data gap
                     continue
                 elif firstTimeBelowThreshold is None:  # radome is dry for the first time
-                    timeToDry = time - endOfRain
                     firstTimeBelowThreshold = time
-                    buffer_time = np.timedelta64(180, "s") * difference.loc[{'time': time}].values
-                elif firstTimeBelowThreshold + buffer_time < time:  # add 2 minutes of flagged data after dry
+                    buffer_time = buffer_time_func(difference.loc[{'time': time}].values)
+                elif firstTimeBelowThreshold + buffer_time > time:  # add 2 minutes of flagged data after dry
                     continue
                 else:
                     dry = True
-                    endOfRain = None
-                    ds['durationOfRain'].loc[{'time': firstTimeBelowThreshold}] = durationOfRain / np.timedelta64(1, 's')
+                    try:
+                        # if dried during large data gap, shortest possible dry time is used
+                        endTimeOfDrying = np.nanmin([firstTimeBelowThreshold.values, firstMissing.values])
+                    except (TypeError, AttributeError):
+                        # no data gap during drying event
+                        endTimeOfDrying = firstTimeBelowThreshold
+                    timeToDry = endTimeOfDrying - endOfRain
+                    ds['durationOfRain'].loc[{'time': firstTimeBelowThreshold}] = durationOfRain / np.timedelta64(1,
+                                                                                                                  's')
                     ds['timeToDry'].loc[{'time': firstTimeBelowThreshold}] = timeToDry / np.timedelta64(1, 's')
+                    ds['maxDiff'].loc[{'time': firstTimeBelowThreshold}] = maxDiff
+                    ds['integratedDiff'].loc[{'time': firstTimeBelowThreshold}] = integratedDiff
                     firstTimeBelowThreshold = None
+                    integratedDiff = 0
+                    maxDiff = 0
+                    endOfRain = None
             elif not dry and rain:  # rain starts again before radome is dry
                 if endOfRain is not None:
-                    # Likely rain continued but was not detected by rainsensor
+                    # Likely rain continued but was not detected by rain sensor
                     endOfRain = None
                     firstTimeBelowThreshold = None
+                    firstMissing = None
         ds["radome_wet"] = xr.Variable(dims=('time'),
                                             data=np.array(wetRadomeTimeSeries).astype('float32'),
                                             encoding=dict(dtype='float32')
                                             )
-        ds['durationOfRain'].attrs = OrderedDict([('long_name', 'duration of rain event'),
-                                ('unit', 's'),
-                                ('comment', "Consecutive rain events, without complete drying of radome are counted" +
-                                 " as one.")
-                                ])
-        ds['timeToDry'].attrs = OrderedDict([('long_name', 'duration of wet radome after rain event'),
-                                ('unit', 's'),
-                                ('comment', "This variable is calculated only using the bias between spectral " +
-                                 "retrieval and observation. It is the time between end of rain event (rain sensor)" +
-                                 " and first time the difference is below a threshold.")
-                                             ])
         return ds
 
     def saveRadomeMonitoringTimeSeries(self, ds: xr.Dataset, day: np.datetime64):
@@ -739,21 +792,12 @@ class MWRQualityEprof(MWRQuality):
         ds = self.mergeMeasurementRetrieval(ds, dsR)
         try:
             ds['difference'] = ds[self.tbVar].copy()
-            ds['difference'] = (["time", self.freq],ds[self.tbVar].values - ds['tb_retrieval'].values)
+            ds['difference'] = (["time", self.freq], ds[self.tbVar].values - ds['tb_retrieval'].values)
         except KeyError:
             pass  # No retrieval found
         ds = ds.rename({self.flagVar: "quality_flag_orig"})
         ds[self.flagVar] = ds["quality_flag_orig"].loc[{self.freq: ds[self.freq].values[0]}]
-        ds["durationOfRain"] = xr.Variable(dims=('time'),
-                                           data=ds[self.flagVar].values.copy(),
-                                           encoding=dict(dtype="float32")
-                                           )
-        ds["durationOfRain"][:] = np.nan
-        ds["timeToDry"] = xr.Variable(dims=('time'),
-                                      data=ds[self.flagVar].values.copy(),
-                                      encoding=dict(dtype="float32")
-                                      )
-        ds["timeToDry"][:] = np.nan
+        ds = self.addRadomeVariablesToDataset(ds)
         return ds
 
     def combineFlags(self, ds: xr.Dataset) -> xr.Dataset:
@@ -768,12 +812,16 @@ class MWRQualityEprof(MWRQuality):
             for b in np.arange(1, noOfBits + 1):
                 binArr[:, -b] = binArr[:, -b] / b
             # add newly computed flags to old ones
-            for flag, bit in zip(["radome_wet"], [3]):
-                binArr[:, noOfBits - bit - 1] = np.nanmax([ds[flag].values, binArr[:, noOfBits - bit - 1]], axis = 0)
+            for flag, bit in zip(["missing_data", "radome_wet"], [0, 5]):
+                # add missing_data to missing and radome_wet to rain
+                try:
+                    binArr[:, noOfBits - bit - 1] = np.nanmax([ds[flag].values, binArr[:, noOfBits - bit - 1]], axis=0)
+                except KeyError:
+                    pass
             # undo the binary array thing
             flag_sum = binArr[:, noOfBits - 1].copy()
             for bit in np.arange(1, noOfBits):
-                flag_sum = flag_sum + binArr[:, noOfBits - bit - 1] * 2**bit
+                flag_sum = flag_sum + binArr[:, noOfBits - bit - 1] * 2 ** bit
             # replace flag for this freq
             ds["quality_flag"].loc[{self.freq: freq}] = flag_sum
         return ds
